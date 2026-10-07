@@ -17,10 +17,6 @@ jobs:
         with:
           node-version: 18
       - name: Install Dependencies
-        run: |
-          npm install
-        working-directory: ./task-manager-api-24DIT026
+        run: npm install
       - name: Run Automated Unit Tests
-        run: |
-          npm test
-        working-directory: ./task-manager-api-24DIT026
+        run: npm test
