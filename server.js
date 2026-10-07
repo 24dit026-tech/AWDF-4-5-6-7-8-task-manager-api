@@ -10,6 +10,13 @@ const User = require("./models/User");
 const authMiddleware = require("./middleware/auth");
 const { validateTask, validateAuth } = require("./middleware/validate");
 
+// Practical 9: In-Memory Caching Module
+const { cache, getStats, recordHit, recordMiss } = require("./cache");
+
+// Practical 10: Event-Driven Architecture Module
+const taskEvents = require("./events");
+require("./listeners"); // Register async event listeners
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || "fallback_secret_key_24dit026";
@@ -25,19 +32,65 @@ app.use((req, res, next) => {
 });
 
 // MongoDB Connection
+const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/taskDB";
 mongoose
-  .connect(process.env.MONGO_URI || "mongodb://localhost:27017/taskDB")
+  .connect(MONGO_URI)
   .then(() => {
     console.log("✅ MongoDB Connected Successfully");
   })
   .catch((err) => {
-    console.log("❌ MongoDB Connection Failed");
-    console.log(err);
+    console.log("❌ MongoDB Connection Failed:", err.message);
   });
 
 // Home Route
 app.get("/", (req, res) => {
-  res.send("Task Manager API with JWT Authentication & Validation is Running!");
+  res.send("Task Manager API (Practicals 4-13) is Running!");
+});
+
+// ==================== PRACTICAL 9: DEBUG CACHE ENDPOINT ====================
+app.get("/debug/cache-stats", (req, res) => {
+  res.status(200).json({
+    success: true,
+    stats: getStats()
+  });
+});
+
+// ==================== PRACTICAL 13: AI DESCRIPTION ENDPOINT ====================
+app.post("/api/ai/generate-description", async (req, res) => {
+  const { title } = req.body;
+  if (!title) {
+    return res.status(400).json({ success: false, message: "Title is required for AI generation" });
+  }
+
+  try {
+    const apiKey = process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY;
+
+    if (apiKey && apiKey.startsWith("sk-")) {
+      const { OpenAI } = require("openai");
+      const client = new OpenAI({ apiKey });
+      const completion = await client.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: `Write a concise 2-sentence task description for: ${title}` }]
+      });
+      const aiText = completion.choices[0].message.content;
+      return res.status(200).json({ description: aiText, fallback: false });
+    }
+
+    // Graceful Fallback if API Key not set or demo mode
+    const fallbackDescription = `Auto-generated workflow for "${title}": 1. Review functional requirements and data models. 2. Implement unit tests and verify deployment pipeline.`;
+    return res.status(200).json({
+      description: fallbackDescription,
+      fallback: true,
+      notice: "AI fallback mode active (Server-side key safe in .env)"
+    });
+  } catch (err) {
+    // Graceful Degradation - Never crash main app
+    return res.status(200).json({
+      description: `Task breakdown for "${title}": Complete implementation and perform QA testing.`,
+      fallback: true,
+      error: err.message
+    });
+  }
 });
 
 // ==================== AUTHENTICATION ROUTES ====================
@@ -139,19 +192,58 @@ app.get("/me", authMiddleware, async (req, res, next) => {
   }
 });
 
-// ==================== PROTECTED TASK ROUTES ====================
+// ==================== PROTECTED TASK ROUTES WITH CACHING & EVENTS ====================
 
-// GET - Read All Tasks (Protected)
+// GET - Read All Tasks (Practical 9: In-Memory Caching)
 app.get("/tasks", authMiddleware, async (req, res, next) => {
   try {
+    const cacheKey = "all_tasks";
+    const cachedData = cache.get(cacheKey);
+
+    if (cachedData) {
+      recordHit();
+      res.setHeader("X-Cache", "HIT");
+      return res.status(200).json(cachedData);
+    }
+
+    recordMiss();
     const tasks = await Task.find();
+    cache.set(cacheKey, tasks);
+    res.setHeader("X-Cache", "MISS");
     res.status(200).json(tasks);
   } catch (err) {
     next(err);
   }
 });
 
-// POST - Create Task (Protected + Validated)
+// GET - Read Task By ID (Practical 9: Single Task Caching)
+app.get("/tasks/:id", authMiddleware, async (req, res, next) => {
+  try {
+    const cacheKey = `task_${req.params.id}`;
+    const cachedTask = cache.get(cacheKey);
+
+    if (cachedTask) {
+      recordHit();
+      res.setHeader("X-Cache", "HIT");
+      return res.status(200).json(cachedTask);
+    }
+
+    recordMiss();
+    const task = await Task.findById(req.params.id);
+
+    if (!task) {
+      return res.status(404).json({ message: "Task not found" });
+    }
+
+    cache.set(cacheKey, task);
+    res.setHeader("X-Cache", "MISS");
+    res.status(200).json(task);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST - Create Task (Practical 9: Cache Invalidation & Practical 10: Async EventEmitter)
 app.post("/tasks", authMiddleware, validateTask, async (req, res, next) => {
   try {
     const task = await Task.create({
@@ -160,30 +252,21 @@ app.post("/tasks", authMiddleware, validateTask, async (req, res, next) => {
       priority: req.body.priority
     });
 
+    // Invalidate Cache on Write
+    cache.del("all_tasks");
+
+    // Send HTTP Response IMMEDIATELY
+    console.log(`[API] Response sent for POST /tasks at ${new Date().toISOString()}`);
     res.status(201).json(task);
+
+    // Emit Async Background Event AFTER Response
+    taskEvents.emit("task-created", task);
   } catch (err) {
     next(err);
   }
 });
 
-// GET Task By ID (Protected)
-app.get("/tasks/:id", authMiddleware, async (req, res, next) => {
-  try {
-    const task = await Task.findById(req.params.id);
-
-    if (!task) {
-      return res.status(404).json({
-        message: "Task not found"
-      });
-    }
-
-    res.status(200).json(task);
-  } catch (err) {
-    next(err);
-  }
-});
-
-// UPDATE Task (Protected)
+// UPDATE Task (Practical 9: Cache Invalidation)
 app.put("/tasks/:id", authMiddleware, async (req, res, next) => {
   try {
     const task = await Task.findByIdAndUpdate(req.params.id, req.body, {
@@ -192,10 +275,12 @@ app.put("/tasks/:id", authMiddleware, async (req, res, next) => {
     });
 
     if (!task) {
-      return res.status(404).json({
-        message: "Task not found"
-      });
+      return res.status(404).json({ message: "Task not found" });
     }
+
+    // Invalidate both all-tasks cache and single-task cache
+    cache.del("all_tasks");
+    cache.del(`task_${req.params.id}`);
 
     res.status(200).json(task);
   } catch (err) {
@@ -203,20 +288,25 @@ app.put("/tasks/:id", authMiddleware, async (req, res, next) => {
   }
 });
 
-// DELETE Task (Protected)
+// DELETE Task (Practical 9: Cache Invalidation & Practical 10: Async EventEmitter)
 app.delete("/tasks/:id", authMiddleware, async (req, res, next) => {
   try {
     const task = await Task.findByIdAndDelete(req.params.id);
 
     if (!task) {
-      return res.status(404).json({
-        message: "Task not found"
-      });
+      return res.status(404).json({ message: "Task not found" });
     }
 
-    res.status(200).json({
-      message: "Task deleted successfully"
-    });
+    // Invalidate Cache on Write
+    cache.del("all_tasks");
+    cache.del(`task_${req.params.id}`);
+
+    // Respond Immediately
+    console.log(`[API] Response sent for DELETE /tasks/${req.params.id} at ${new Date().toISOString()}`);
+    res.status(200).json({ message: "Task deleted successfully" });
+
+    // Emit Async Background Event AFTER Response
+    taskEvents.emit("task-deleted", { id: req.params.id, title: task.title });
   } catch (err) {
     next(err);
   }
@@ -239,7 +329,12 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Start Server
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// Export app for Jest testing (Practical 12)
+module.exports = app;
+
+// Start Server if run directly
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
